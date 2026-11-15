@@ -33,6 +33,17 @@ export function isSettledDelivery(delivery: DeliveryStanding): boolean {
   return delivery.state === 'user_confirmed' || (delivery.state === 'transfer_observed' && !isUnconfirmedReplacement(delivery));
 }
 
+/**
+ * When the device finished receiving a settled delivery, or null while it is not known to hold the
+ * copy. Both settled states are entered by a state change that stamps `updatedAt`, and a repeated
+ * transfer of the same copy stamps it again, so it is the latest moment the copy reached the device
+ * (a replacement's confirmation can only be later). A counter the device keeps for the book cannot
+ * have started before it.
+ */
+export function deliveredAt(delivery: DeliveryStanding & Pick<KoboDeliveryRecord, 'updatedAt'>): Date | null {
+  return isSettledDelivery(delivery) ? delivery.updatedAt : null;
+}
+
 export function deliveryErrorCode(error: unknown): string | null {
   if (!(error instanceof HttpException)) return null;
   const response = error.getResponse();

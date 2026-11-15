@@ -210,6 +210,199 @@ describe('ReadingSessionRepository.recordCumulativeSyncedSession', () => {
   });
 });
 
+describe('ReadingSessionRepository.recordCumulativeSyncedSession from a known counter origin', () => {
+  const deliveredAt = new Date('2026-11-14T22:57:00.000Z');
+  const pushedAt = new Date('2026-11-14T23:31:00.000Z');
+  const firstPush = (overrides: Partial<RecordCumulativeReadingSessionParams> = {}) =>
+    params({ counter: 33, endedAt: pushedAt, counterOriginAt: deliveredAt, progressDelta: null, ...overrides });
+
+  it('records the first counter after delivery as a session and baselines the cursor with it', async () => {
+    const { repo, cursorInsertValues, cursorUpdateSet, sessionValues, dailyValues } = makeHarness();
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush())).resolves.toEqual({
+      kind: 'saved',
+      durationSeconds: 1980,
+      progressDelta: null,
+      sessionId: 'kst:30:53:0:33',
+    });
+
+    expect(sessionValues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: 'kst:30:53:0:33',
+        sourceDeviceKey: '30',
+        startedAt: new Date('2026-11-14T22:58:00.000Z'),
+        endedAt: pushedAt,
+        durationSeconds: 1980,
+        syncIntervalStartedAt: deliveredAt,
+      }),
+    );
+    expect(cursorInsertValues).toHaveBeenCalledWith(expect.objectContaining({ counter: 33, generation: 0, lastModified: pushedAt }));
+    expect(cursorUpdateSet).not.toHaveBeenCalled();
+    expect(dailyValues).toHaveBeenCalledOnce();
+  });
+
+  it('holds the session to the time since the counter origin', async () => {
+    const { repo, sessionValues } = makeHarness();
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush({ counter: 90 }))).resolves.toMatchObject({ kind: 'saved', durationSeconds: 2040 });
+
+    expect(sessionValues).toHaveBeenCalledWith(expect.objectContaining({ startedAt: deliveredAt, durationSeconds: 2040 }));
+  });
+
+  it('takes measured sessions off the first counter and measures them from the origin', async () => {
+    const { repo, sessionValues, measuredWhere } = makeHarness({ measuredSeconds: 600 });
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush())).resolves.toMatchObject({ kind: 'saved', durationSeconds: 1380 });
+
+    expect(sessionValues).toHaveBeenCalledWith(expect.objectContaining({ durationSeconds: 1380 }));
+    expect(boundParams(measuredWhere)).toEqual(expect.arrayContaining([deliveredAt.toISOString(), pushedAt.toISOString(), 'kobo', '30', 'kst:30:%']));
+  });
+
+  it('skips the first counter when measured sessions already cover it, still establishing the cursor', async () => {
+    const { repo, cursorInsertValues, sessionValues } = makeHarness({ measuredSeconds: 1950 });
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush())).resolves.toEqual({ kind: 'skipped', reason: 'measured_session_present' });
+
+    expect(cursorInsertValues).toHaveBeenCalledWith(expect.objectContaining({ counter: 33 }));
+    expect(sessionValues).not.toHaveBeenCalled();
+  });
+
+  it('does not count the minutes of a counter pushed less than a tick after delivery', async () => {
+    const { repo, cursorInsertValues, sessionValues } = makeHarness();
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush({ counter: 0 }))).resolves.toEqual({ kind: 'baseline' });
+    expect(cursorInsertValues).toHaveBeenCalledWith(expect.objectContaining({ counter: 0 }));
+    expect(sessionValues).not.toHaveBeenCalled();
+  });
+
+  it('keeps the baseline when there is no origin', async () => {
+    for (const counterOriginAt of [undefined, null]) {
+      const { repo, cursorInsertValues, sessionValues } = makeHarness();
+
+      await expect(repo.recordCumulativeSyncedSession(firstPush({ counterOriginAt }))).resolves.toEqual({ kind: 'baseline' });
+
+      expect(cursorInsertValues).toHaveBeenCalledWith(expect.objectContaining({ counter: 33, generation: 0 }));
+      expect(sessionValues).not.toHaveBeenCalled();
+    }
+  });
+
+  it('keeps the baseline when the origin is not before the push', async () => {
+    const { repo, sessionValues } = makeHarness();
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush({ counterOriginAt: pushedAt }))).resolves.toEqual({ kind: 'baseline' });
+    expect(sessionValues).not.toHaveBeenCalled();
+  });
+
+  it('leaves the cursor unwritten while the file cannot be resolved, so the first counter is retried', async () => {
+    const { repo, cursorInsertValues, sessionValues } = makeHarness();
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush({ bookFileId: null }))).resolves.toEqual({
+      kind: 'skipped',
+      reason: 'book_file_not_found',
+    });
+
+    expect(cursorInsertValues).not.toHaveBeenCalled();
+    expect(sessionValues).not.toHaveBeenCalled();
+  });
+
+  it('still establishes the cursor when the first session is a duplicate id', async () => {
+    const { repo, cursorInsertValues, dailyValues } = makeHarness({ inserted: false });
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush())).resolves.toEqual({ kind: 'skipped', reason: 'duplicate_session_id' });
+
+    expect(cursorInsertValues).toHaveBeenCalledWith(expect.objectContaining({ counter: 33 }));
+    expect(dailyValues).not.toHaveBeenCalled();
+  });
+
+  it('counts only the new minutes on the push after the first, and nothing on a replay', async () => {
+    const afterFirst = { counter: 33, generation: 0, lastModified: pushedAt };
+    const next = new Date('2026-11-14T23:39:00.000Z');
+
+    const second = makeHarness({ cursor: afterFirst });
+    await expect(second.repo.recordCumulativeSyncedSession(firstPush({ counter: 34, endedAt: next }))).resolves.toMatchObject({
+      kind: 'saved',
+      durationSeconds: 60,
+      sessionId: 'kst:30:53:0:34',
+    });
+    expect(second.sessionValues).toHaveBeenCalledWith(expect.objectContaining({ durationSeconds: 60, syncIntervalStartedAt: pushedAt }));
+
+    const replay = makeHarness({ cursor: afterFirst });
+    await expect(replay.repo.recordCumulativeSyncedSession(firstPush())).resolves.toEqual({ kind: 'unchanged' });
+    expect(replay.sessionValues).not.toHaveBeenCalled();
+  });
+
+  it('does not use the origin once the counter has a cursor to take a delta against', async () => {
+    const { repo, sessionValues } = makeHarness({ cursor: { counter: 20, generation: 1, lastModified: new Date('2026-11-14T23:00:00.000Z') } });
+
+    await expect(repo.recordCumulativeSyncedSession(firstPush({ counterOriginAt: new Date('2026-11-14T22:00:00.000Z') }))).resolves.toMatchObject({
+      kind: 'saved',
+      durationSeconds: 780,
+    });
+    expect(sessionValues).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'kst:30:53:1:33', syncIntervalStartedAt: new Date('2026-11-14T23:00:00.000Z') }),
+    );
+  });
+
+  describe('when the counter went down', () => {
+    const lastPush = new Date('2026-11-14T20:00:00.000Z');
+    const redelivered = new Date('2026-11-14T22:57:00.000Z');
+    const cursor = { counter: 240, generation: 2, lastModified: lastPush };
+
+    it('records the new counter as a session in the next generation after a re-delivery since the last push', async () => {
+      const { repo, cursorUpdateSet, sessionValues } = makeHarness({ cursor });
+
+      await expect(repo.recordCumulativeSyncedSession(firstPush({ counterOriginAt: redelivered }))).resolves.toEqual({
+        kind: 'saved',
+        durationSeconds: 1980,
+        progressDelta: null,
+        sessionId: 'kst:30:53:3:33',
+      });
+
+      expect(sessionValues).toHaveBeenCalledWith(expect.objectContaining({ durationSeconds: 1980, syncIntervalStartedAt: redelivered }));
+      expect(cursorUpdateSet).toHaveBeenCalledWith(expect.objectContaining({ counter: 33, generation: 3, lastModified: pushedAt }));
+    });
+
+    it('holds the session to the time since the re-delivery', async () => {
+      const { repo, sessionValues } = makeHarness({ cursor });
+
+      await expect(repo.recordCumulativeSyncedSession(firstPush({ counter: 200, counterOriginAt: redelivered }))).resolves.toMatchObject({
+        kind: 'saved',
+        durationSeconds: 2040,
+      });
+      expect(sessionValues).toHaveBeenCalledWith(expect.objectContaining({ durationSeconds: 2040 }));
+    });
+
+    it('moves to the next generation without a session when the book was not re-delivered since the last push', async () => {
+      const { repo, cursorUpdateSet, sessionValues } = makeHarness({ cursor });
+
+      await expect(repo.recordCumulativeSyncedSession(firstPush({ counterOriginAt: new Date('2026-11-13T09:00:00.000Z') }))).resolves.toEqual({
+        kind: 'reset',
+      });
+
+      expect(cursorUpdateSet).toHaveBeenCalledWith(expect.objectContaining({ counter: 33, generation: 3 }));
+      expect(sessionValues).not.toHaveBeenCalled();
+    });
+
+    it('moves to the next generation without a session when there is no origin', async () => {
+      const { repo, cursorUpdateSet, sessionValues } = makeHarness({ cursor });
+
+      await expect(repo.recordCumulativeSyncedSession(firstPush({ counterOriginAt: null }))).resolves.toEqual({ kind: 'reset' });
+
+      expect(cursorUpdateSet).toHaveBeenCalledWith(expect.objectContaining({ generation: 3 }));
+      expect(sessionValues).not.toHaveBeenCalled();
+    });
+
+    it('reports a reset when the re-delivered counter has not yet reached a tick', async () => {
+      const { repo, cursorUpdateSet, sessionValues } = makeHarness({ cursor });
+
+      await expect(repo.recordCumulativeSyncedSession(firstPush({ counter: 0, counterOriginAt: redelivered }))).resolves.toEqual({ kind: 'reset' });
+
+      expect(cursorUpdateSet).toHaveBeenCalledWith(expect.objectContaining({ counter: 0, generation: 3 }));
+      expect(sessionValues).not.toHaveBeenCalled();
+    });
+  });
+});
+
 describe('ReadingSessionRepository measured-session reconciliation', () => {
   type EstimateRow = { id: number; startedAt: Date; endedAt: Date; durationSeconds: number; progressDelta: number | null };
   type IntervalEstimateRow = EstimateRow & { syncIntervalStartedAt: Date };

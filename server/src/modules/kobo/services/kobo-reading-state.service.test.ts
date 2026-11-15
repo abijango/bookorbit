@@ -1293,6 +1293,69 @@ describe('KoboReadingStateService', () => {
       expect(call.endedAt.getTime()).toBeLessThanOrEqual(Date.now());
     });
 
+    describe('counter origin', () => {
+      const DELIVERED_AT = new Date('2026-08-20T18:57:00.000Z');
+      const delivery = (overrides: Record<string, unknown> = {}) => ({
+        id: 'delivery-1',
+        previousId: null,
+        state: 'transfer_observed',
+        options: {},
+        updatedAt: DELIVERED_AT,
+        ...overrides,
+      });
+
+      async function pushWith(current: unknown, existingDeliveryId?: string) {
+        const db = makeStatsDb(undefined);
+        if (existingDeliveryId) db.query.koboDeviceReadingStates.findFirst.mockResolvedValue({ deliveryId: existingDeliveryId });
+        await makeService(db, { current: vi.fn().mockResolvedValue(current) }).upsertState(
+          7,
+          46,
+          { Statistics: { LastModified: STATS_AT, SpentReadingMinutes: 33 } },
+          1,
+          99,
+          false,
+          30,
+        );
+        return readingSessions.recordCumulativeSyncedSession.mock.calls[0]![0] as { counterOriginAt: Date | null; counter: number };
+      }
+
+      it('bounds the counter by when the device finished receiving the delivered book', async () => {
+        await expect(pushWith(delivery())).resolves.toMatchObject({ counter: 33, counterOriginAt: DELIVERED_AT });
+      });
+
+      it('bounds the counter of a confirmed replacement by when the confirmed copy settled', async () => {
+        const confirmed = delivery({ id: 'new', previousId: 'old', state: 'user_confirmed', options: { replacement: true } });
+
+        await expect(pushWith(confirmed, 'new')).resolves.toMatchObject({ counterOriginAt: DELIVERED_AT });
+      });
+
+      it('has no origin for a book BookOrbit has no delivery for', async () => {
+        await expect(pushWith(null)).resolves.toMatchObject({ counterOriginAt: null });
+      });
+
+      it('has no origin when the service holds no delivery records at all', async () => {
+        const db = makeStatsDb(undefined);
+
+        await push(db, { LastModified: STATS_AT, SpentReadingMinutes: 33 });
+
+        expect(readingSessions.recordCumulativeSyncedSession).toHaveBeenCalledWith(expect.objectContaining({ counterOriginAt: null }));
+      });
+
+      it.each(['offered', 'prepared', 'cancelled'])('has no origin while the delivery is %s', async (state) => {
+        await expect(pushWith(delivery({ state }))).resolves.toMatchObject({ counterOriginAt: null });
+      });
+
+      it('has no origin while a replacement copy is unconfirmed', async () => {
+        const unconfirmed = delivery({ id: 'new', previousId: 'old', options: { replacement: true } });
+
+        await expect(pushWith(unconfirmed, 'old')).resolves.toMatchObject({ counterOriginAt: null });
+      });
+
+      it('has no origin when the bookmark was last attributed to a different copy', async () => {
+        await expect(pushWith(delivery(), 'older-delivery')).resolves.toMatchObject({ counterOriginAt: null });
+      });
+    });
+
     it('rejects a counter too large for the reading-session duration column', async () => {
       const db = makeStatsDb({ SpentReadingMinutes: 1 });
 

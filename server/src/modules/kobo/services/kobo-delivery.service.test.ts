@@ -11,6 +11,7 @@ import { kepubContentDigest } from './kepub-content-digest';
 import {
   KoboDeliveryService,
   deliveryErrorCode,
+  deliveredAt,
   isSettledDelivery,
   isUnconfirmedReplacement,
   type KoboDeliveryRecord,
@@ -278,6 +279,15 @@ describe('delivery standing', () => {
     expect(isUnconfirmedReplacement(replacement({ state: 'transfer_observed', previousId: 'previous' }))).toBe(true);
     expect(isUnconfirmedReplacement(replacement({ state: 'user_confirmed', previousId: 'previous' }))).toBe(false);
     expect(isUnconfirmedReplacement(record({ state: 'transfer_observed' }))).toBe(false);
+  });
+
+  it('dates a delivery from its last state change only once the device is known to hold the copy', () => {
+    const settledAt = new Date('2026-08-20T18:57:00.000Z');
+
+    expect(deliveredAt({ ...record({ state: 'transfer_observed' }), updatedAt: settledAt })).toBe(settledAt);
+    expect(deliveredAt({ ...replacement({ state: 'user_confirmed', previousId: 'previous' }), updatedAt: settledAt })).toBe(settledAt);
+    expect(deliveredAt({ ...record({ state: 'offered' }), updatedAt: settledAt })).toBeNull();
+    expect(deliveredAt({ ...replacement({ state: 'transfer_observed', previousId: 'previous' }), updatedAt: settledAt })).toBeNull();
   });
 });
 

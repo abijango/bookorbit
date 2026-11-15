@@ -17,7 +17,7 @@ import {
 } from '../kobo-statistics-session.util';
 import { KoboAnalyticsResolverService } from './kobo-analytics-resolver.service';
 import { KoboReadingProgressRepository } from '../kobo-reading-progress.repository';
-import { KoboDeliveryService, isSettledDelivery, isUnconfirmedReplacement, type KoboDeliveryRecord } from './kobo-delivery.service';
+import { KoboDeliveryService, deliveredAt, isSettledDelivery, isUnconfirmedReplacement, type KoboDeliveryRecord } from './kobo-delivery.service';
 import { KoboBookAccessService } from './kobo-book-access.service';
 import { KoboBookIdentityService } from './kobo-book-identity.service';
 import { KoboProgressBridgeService, type CanonicalProgressPoint } from './kobo-progress-bridge.service';
@@ -329,6 +329,7 @@ export class KoboReadingStateService {
         previousPercent: protectedRegression ? null : previousPercent,
         mergedPercent: protectedRegression ? null : mergedPercent,
         fallbackLastModified: lastModified,
+        counterOriginAt: delivery && !preparedPrevious && !uncertainDelivery ? deliveredAt(delivery) : null,
       });
     }
 
@@ -366,6 +367,12 @@ export class KoboReadingStateService {
    * on firmware 4.45.23792 does, and after offline reading it pushes the counter and the events
    * together with its next sync, long after the reading.
    *
+   * A device's counter for a book BookOrbit delivered to it starts from zero when the copy arrives,
+   * so a first push, or a counter that went down after the book was delivered again, is itself
+   * the reading since the delivery. That is what the delivery's settled time gives the recorder to
+   * count, held to the time since then. Where the device is not known to hold the copy, the first
+   * counter only sets the baseline, since it may include reading from before BookOrbit's copy.
+   *
    * Each device has an independent durable cursor. Session insertion, daily aggregation, and
    * cursor advancement share one transaction so a failed write is retried from the same counter.
    * Measured analytics sessions and counter-derived sessions are serialized by the same lock and
@@ -383,8 +390,9 @@ export class KoboReadingStateService {
     previousPercent: number | null;
     mergedPercent: number | null;
     fallbackLastModified: string;
+    counterOriginAt: Date | null;
   }): Promise<void> {
-    const { userId, bookId, sourceDeviceId, incomingStats, previousPercent, mergedPercent } = params;
+    const { userId, bookId, sourceDeviceId, incomingStats, previousPercent, mergedPercent, counterOriginAt } = params;
 
     const currentMinutes = this.extractSpentReadingMinutes(incomingStats);
     if (currentMinutes === null) return;
@@ -403,6 +411,7 @@ export class KoboReadingStateService {
         buildSessionId: (bookFileId, generation, counter) => koboStatisticsSessionId(sourceDeviceId, bookFileId, generation, counter),
         counter: currentMinutes,
         endedAt,
+        counterOriginAt,
         progressDelta: this.resolveProgressDelta(previousPercent, mergedPercent),
         endProgress: mergedPercent,
         source: 'kobo',
@@ -410,7 +419,7 @@ export class KoboReadingStateService {
       });
 
       this.logger.log(
-        `[${STATISTICS_SESSION_EVENT}] [end] userId=${userId} bookId=${bookId} deviceId=${sourceDeviceId} bookFileId=${resolved.kind === 'resolved' ? resolved.bookFileId : 'none'} durationMs=${Date.now() - startedAtMs} spentReadingMinutes=${currentMinutes} outcome=${result.kind}${result.kind === 'skipped' ? ` reason=${result.reason}` : ''} - device reading-time counter processed`,
+        `[${STATISTICS_SESSION_EVENT}] [end] userId=${userId} bookId=${bookId} deviceId=${sourceDeviceId} bookFileId=${resolved.kind === 'resolved' ? resolved.bookFileId : 'none'} durationMs=${Date.now() - startedAtMs} spentReadingMinutes=${currentMinutes} counterOrigin=${counterOriginAt ? 'delivery' : 'none'} outcome=${result.kind}${result.kind === 'skipped' ? ` reason=${result.reason}` : ''} - device reading-time counter processed`,
       );
     } catch (error: unknown) {
       const err = error instanceof Error ? error : new Error(String(error));

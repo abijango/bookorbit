@@ -18,7 +18,7 @@ type KoboDevice = { id: number; token: string };
 type Book = { bookId: number; bookFileId: number; entitlementId: string };
 type MeasuredSession = { id: string; startedAt: string; endedAt: string; seconds: number };
 
-const BOOK_COUNT = 13;
+const BOOK_COUNT = 18;
 const RUN = randomUUID().slice(0, 8);
 
 /** Day `n` of a calendar that starts on 2026-03-01, so every scenario owns its own dates. */
@@ -110,6 +110,35 @@ describe('Kobo reading time reconciliation (e2e)', { timeout: 180_000 }, () => {
       },
     });
     expect(response.statusCode).toBe(200);
+  }
+
+  /**
+   * The device downloads the book from this server, as it does after announcing it in a library sync.
+   * The delivery is then dated `minutesAgo` so a counter pushed now has a delivery to be measured from.
+   */
+  async function deliver(device: KoboDevice, book: Book, minutesAgo: number): Promise<void> {
+    const response = await ctx.app.inject({ method: 'GET', url: `/api/v1/kobo/${device.token}/v1/books/${book.bookId}/download` });
+    expect(response.statusCode).toBe(200);
+
+    const where = and(
+      eq(schema.koboDeviceDeliveries.userId, userId),
+      eq(schema.koboDeviceDeliveries.deviceId, device.id),
+      eq(schema.koboDeviceDeliveries.bookId, book.bookId),
+      eq(schema.koboDeviceDeliveries.current, true),
+    );
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const [delivery] = await ctx.db.select({ state: schema.koboDeviceDeliveries.state }).from(schema.koboDeviceDeliveries).where(where);
+      if (delivery?.state === 'transfer_observed') break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    await ctx.db
+      .update(schema.koboDeviceDeliveries)
+      .set({ updatedAt: new Date(Date.now() - minutesAgo * 60_000) })
+      .where(and(where, eq(schema.koboDeviceDeliveries.state, 'transfer_observed')));
+  }
+
+  function minutesAgo(minutes: number): string {
+    return new Date(Date.now() - minutes * 60_000).toISOString();
   }
 
   async function storedSessions(book: Book) {
@@ -474,6 +503,95 @@ describe('Kobo reading time reconciliation (e2e)', { timeout: 180_000 }, () => {
         stored(deviceA, session),
       ]);
       expect(await dailySeconds(49, 50, 51)).toEqual({ [day(50)]: 1505 });
+    });
+  });
+
+  describe('the first counter pushed for a book', () => {
+    it('counts the reading since BookOrbit delivered the book, then only the minutes after it', async () => {
+      const book = books[13]!;
+      await deliver(deviceA, book, 35);
+      const deliveredAt = (
+        await ctx.db
+          .select({ updatedAt: schema.koboDeviceDeliveries.updatedAt })
+          .from(schema.koboDeviceDeliveries)
+          .where(and(eq(schema.koboDeviceDeliveries.deviceId, deviceA.id), eq(schema.koboDeviceDeliveries.bookId, book.bookId)))
+      )[0]!.updatedAt;
+
+      const firstPushAt = minutesAgo(1);
+      await pushCounter(deviceA, book, 33, firstPushAt);
+
+      expect(await storedSessions(book)).toEqual([
+        estimate(deviceA, book, 33, firstPushAt, 1980, deliveredAt.toISOString(), { progressDelta: null }),
+      ]);
+
+      await pushCounter(deviceA, book, 33, firstPushAt);
+      expect(await storedSessions(book)).toHaveLength(1);
+
+      const secondPushAt = new Date().toISOString();
+      await pushCounter(deviceA, book, 34, secondPushAt);
+
+      expect(await storedSessions(book)).toEqual([
+        estimate(deviceA, book, 33, firstPushAt, 1980, deliveredAt.toISOString(), { progressDelta: null }),
+        estimate(deviceA, book, 34, secondPushAt, 60, firstPushAt, { progressDelta: 0 }),
+      ]);
+    });
+
+    it('holds the first counter to the time since the delivery', async () => {
+      const book = books[14]!;
+      await deliver(deviceA, book, 35);
+
+      const pushedAt = minutesAgo(1);
+      await pushCounter(deviceA, book, 90, pushedAt);
+
+      const sessions = await storedSessions(book);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]).toMatchObject({ seconds: 2040, endedAt: pushedAt });
+    });
+
+    it('takes the sessions the device measured since the delivery off the first counter', async () => {
+      const book = books[15]!;
+      await deliver(deviceA, book, 35);
+      const session: MeasuredSession = {
+        id: `${RUN}-measured-after-delivery`,
+        startedAt: minutesAgo(30),
+        endedAt: minutesAgo(20),
+        seconds: 600,
+      };
+      await sendMeasured(deviceA, book, [session]);
+
+      const pushedAt = minutesAgo(1);
+      await pushCounter(deviceA, book, 33, pushedAt);
+
+      const sessions = await storedSessions(book);
+      expect(sessions.map((row) => [row.sessionId, row.seconds])).toEqual([
+        [session.id, 600],
+        [`kst:${deviceA.id}:${book.bookFileId}:0:33`, 1380],
+      ]);
+    });
+
+    it('only sets a baseline for a book BookOrbit has not delivered to the device', async () => {
+      const book = books[16]!;
+
+      await pushCounter(deviceA, book, 33, minutesAgo(1));
+      expect(await storedSessions(book)).toEqual([]);
+
+      await pushCounter(deviceA, book, 34, new Date().toISOString());
+      expect(await storedSessions(book)).toHaveLength(1);
+      expect((await storedSessions(book))[0]!.seconds).toBe(60);
+    });
+
+    it('records the counter of a book delivered again after its counter was last pushed', async () => {
+      const book = books[17]!;
+      await pushCounter(deviceA, book, 240, minutesAgo(180));
+      expect(await storedSessions(book)).toEqual([]);
+
+      await deliver(deviceA, book, 35);
+      const pushedAt = minutesAgo(1);
+      await pushCounter(deviceA, book, 33, pushedAt);
+
+      const sessions = await storedSessions(book);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]).toMatchObject({ sessionId: `kst:${deviceA.id}:${book.bookFileId}:1:33`, seconds: 1980, endedAt: pushedAt });
     });
   });
 });

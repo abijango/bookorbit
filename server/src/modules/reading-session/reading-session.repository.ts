@@ -117,11 +117,30 @@ export interface RecordCumulativeReadingSessionParams {
   buildSessionId: (bookFileId: number, generation: number, counter: number) => string;
   counter: number;
   endedAt: Date;
+  /**
+   * When the counter is known to have started from zero, such as the moment the device finished
+   * receiving the book from this server. Without a cursor, or when the counter went down, there is
+   * nothing to take a delta against; with this, the counter itself is the reading since then, and
+   * is held to the time that has passed. Leave it unset when the counter may include earlier reading.
+   */
+  counterOriginAt?: Date | null;
   progressDelta: number | null;
   endProgress: number | null;
   source: ReadingSessionSource;
   timeZone: string;
 }
+
+interface CounterInterval {
+  fromCounter: number;
+  windowStart: Date;
+  generation: number;
+  /** Set when the counter is read from zero at the origin: it cannot cover more time than the window. */
+  boundedByWindow: boolean;
+  /** What to report when the interval holds less than one counter tick of unmeasured reading. */
+  emptyKind: 'baseline' | 'reset';
+}
+
+type SyncCursorRow = { counter: number; generation: number; lastModified: Date };
 
 export interface InsertManualSessionParams {
   userId: number;
@@ -301,109 +320,151 @@ export class ReadingSessionRepository {
         )
         .limit(1);
 
-      if (!cursor) {
-        await tx.insert(readingSessionSyncCursors).values({
-          userId: params.userId,
-          bookId: params.bookId,
-          source: params.cursorSource,
-          sourceDeviceKey: params.sourceDeviceKey,
-          counter: params.counter,
-          lastModified: params.endedAt,
-        });
-        return { kind: 'baseline' };
+      const resolved = await this.resolveCounterInterval(tx, params, cursor);
+      if ('result' in resolved) return resolved.result;
+
+      return this.storeCounterInterval(tx, params, cursor, resolved.interval);
+    });
+  }
+
+  private async resolveCounterInterval(
+    tx: Tx,
+    params: RecordCumulativeReadingSessionParams,
+    cursor: SyncCursorRow | undefined,
+  ): Promise<{ interval: CounterInterval } | { result: RecordCumulativeReadingSessionResult }> {
+    const origin = params.counterOriginAt && params.counterOriginAt.getTime() < params.endedAt.getTime() ? params.counterOriginAt : null;
+
+    if (!cursor) {
+      if (!origin) {
+        await this.writeSyncCursor(tx, params, 0, false);
+        return { result: { kind: 'baseline' } };
       }
+      return { interval: { fromCounter: 0, windowStart: origin, generation: 0, boundedByWindow: true, emptyKind: 'baseline' } };
+    }
 
-      if (params.endedAt.getTime() < cursor.lastModified.getTime()) return { kind: 'stale' };
+    if (params.endedAt.getTime() < cursor.lastModified.getTime()) return { result: { kind: 'stale' } };
 
-      if (params.counter === cursor.counter) {
-        if (params.endedAt.getTime() > cursor.lastModified.getTime()) {
-          await this.updateSyncCursor(tx, params, cursor.generation);
-        }
-        return { kind: 'unchanged' };
+    if (params.counter === cursor.counter) {
+      if (params.endedAt.getTime() > cursor.lastModified.getTime()) {
+        await this.writeSyncCursor(tx, params, cursor.generation, true);
       }
+      return { result: { kind: 'unchanged' } };
+    }
 
-      if (params.counter < cursor.counter) {
-        await this.updateSyncCursor(tx, params, cursor.generation + 1);
-        return { kind: 'reset' };
+    if (params.counter < cursor.counter) {
+      // A counter that went down was reset on the device. It only reads from zero at a known moment
+      // when the book was delivered again after the last push; otherwise nothing says when it began.
+      if (origin && origin.getTime() > cursor.lastModified.getTime()) {
+        return {
+          interval: { fromCounter: 0, windowStart: origin, generation: cursor.generation + 1, boundedByWindow: true, emptyKind: 'reset' },
+        };
       }
+      await this.writeSyncCursor(tx, params, cursor.generation + 1, true);
+      return { result: { kind: 'reset' } };
+    }
 
-      // The counter covers everything read since the previous push, however long ago that reading
-      // was: a device that read offline only pushes with its next sync. The share of measured
-      // sessions that falls in that interval is subtracted rather than taken as proof the whole
-      // delta is covered, so reading the device did not measure is kept.
-      const counterSeconds = (params.counter - cursor.counter) * 60;
+    return {
+      interval: {
+        fromCounter: cursor.counter,
+        windowStart: cursor.lastModified,
+        generation: cursor.generation,
+        boundedByWindow: false,
+        emptyKind: 'baseline',
+      },
+    };
+  }
 
-      const [measured] = await tx
-        .select({ seconds: sql<number>`coalesce(sum(${measuredSecondsInWindow(cursor.lastModified, params.endedAt)}), 0)::int` })
-        .from(readingSessions)
-        .where(
-          and(
-            eq(readingSessions.userId, params.userId),
-            eq(readingSessions.bookId, params.bookId),
-            eq(readingSessions.source, params.source),
-            eq(readingSessions.sourceDeviceKey, params.sourceDeviceKey),
-            notLike(readingSessions.sessionId, `${params.sessionIdPrefix}%`),
-            lt(readingSessions.startedAt, params.endedAt),
-            gt(readingSessions.endedAt, cursor.lastModified),
-          ),
-        );
+  private async storeCounterInterval(
+    tx: Tx,
+    params: RecordCumulativeReadingSessionParams,
+    cursor: SyncCursorRow | undefined,
+    interval: CounterInterval,
+  ): Promise<RecordCumulativeReadingSessionResult> {
+    const cursorExists = cursor !== undefined;
 
-      const durationSeconds = counterSeconds - (measured?.seconds ?? 0);
-      if (durationSeconds < SYNC_COUNTER_RESOLUTION_SECONDS) {
-        await this.updateSyncCursor(tx, params, cursor.generation);
-        return { kind: 'skipped', reason: 'measured_session_present' };
-      }
+    // The counter covers everything read since the previous push, however long ago that reading
+    // was: a device that read offline only pushes with its next sync. The share of measured
+    // sessions that falls in that interval is subtracted rather than taken as proof the whole
+    // delta is covered, so reading the device did not measure is kept.
+    const counterSeconds = (params.counter - interval.fromCounter) * 60;
+    const elapsedSeconds = Math.floor((params.endedAt.getTime() - interval.windowStart.getTime()) / 1000);
+    const intervalSeconds = interval.boundedByWindow ? Math.min(counterSeconds, elapsedSeconds) : counterSeconds;
 
-      const startedAt = new Date(params.endedAt.getTime() - durationSeconds * 1000);
-      const progressDelta = scaleProgressDelta(params.progressDelta, durationSeconds, counterSeconds);
+    if (intervalSeconds < SYNC_COUNTER_RESOLUTION_SECONDS) {
+      await this.writeSyncCursor(tx, params, interval.generation, cursorExists);
+      return { kind: interval.emptyKind };
+    }
 
-      if (params.bookFileId === null) return { kind: 'skipped', reason: 'book_file_not_found' };
+    const [measured] = await tx
+      .select({ seconds: sql<number>`coalesce(sum(${measuredSecondsInWindow(interval.windowStart, params.endedAt)}), 0)::int` })
+      .from(readingSessions)
+      .where(
+        and(
+          eq(readingSessions.userId, params.userId),
+          eq(readingSessions.bookId, params.bookId),
+          eq(readingSessions.source, params.source),
+          eq(readingSessions.sourceDeviceKey, params.sourceDeviceKey),
+          notLike(readingSessions.sessionId, `${params.sessionIdPrefix}%`),
+          lt(readingSessions.startedAt, params.endedAt),
+          gt(readingSessions.endedAt, interval.windowStart),
+        ),
+      );
 
-      const sessionId = params.buildSessionId(params.bookFileId, cursor.generation, params.counter);
+    const durationSeconds = intervalSeconds - (measured?.seconds ?? 0);
+    if (durationSeconds < SYNC_COUNTER_RESOLUTION_SECONDS) {
+      await this.writeSyncCursor(tx, params, interval.generation, cursorExists);
+      return { kind: 'skipped', reason: 'measured_session_present' };
+    }
 
-      const [fileRow] = await tx
-        .select({ bookId: books.id, libraryId: books.libraryId })
-        .from(bookFiles)
-        .innerJoin(books, eq(books.id, bookFiles.bookId))
-        .where(and(eq(bookFiles.id, params.bookFileId), eq(books.id, params.bookId)))
-        .limit(1);
-      if (!fileRow) return { kind: 'skipped', reason: 'book_file_not_found' };
+    const startedAt = new Date(params.endedAt.getTime() - durationSeconds * 1000);
+    const progressDelta = scaleProgressDelta(params.progressDelta, durationSeconds, intervalSeconds);
 
-      const inserted = await tx
-        .insert(readingSessions)
-        .values({
-          userId: params.userId,
-          bookFileId: params.bookFileId,
-          bookId: params.bookId,
-          attemptId: sql`(select id from reading_attempts where user_id = ${params.userId} and book_id = ${params.bookId} and outcome is null and deleted_at is null limit 1)`,
-          sessionId,
-          source: params.source,
-          sourceDeviceKey: params.sourceDeviceKey,
-          startedAt,
-          endedAt: params.endedAt,
-          durationSeconds,
-          progressDelta,
-          endProgress: params.endProgress,
-          syncIntervalStartedAt: cursor.lastModified,
-        })
-        .onConflictDoNothing({ target: [readingSessions.userId, readingSessions.sessionId] })
-        .returning({ id: readingSessions.id });
+    if (params.bookFileId === null) return { kind: 'skipped', reason: 'book_file_not_found' };
 
-      await this.updateSyncCursor(tx, params, cursor.generation);
-      if (inserted.length === 0) return { kind: 'skipped', reason: 'duplicate_session_id' };
+    const sessionId = params.buildSessionId(params.bookFileId, interval.generation, params.counter);
 
-      await this.upsertDailyStats(tx, {
+    const [fileRow] = await tx
+      .select({ bookId: books.id, libraryId: books.libraryId })
+      .from(bookFiles)
+      .innerJoin(books, eq(books.id, bookFiles.bookId))
+      .where(and(eq(bookFiles.id, params.bookFileId), eq(books.id, params.bookId)))
+      .limit(1);
+    if (!fileRow) return { kind: 'skipped', reason: 'book_file_not_found' };
+
+    const inserted = await tx
+      .insert(readingSessions)
+      .values({
         userId: params.userId,
-        libraryId: fileRow.libraryId,
+        bookFileId: params.bookFileId,
+        bookId: params.bookId,
+        attemptId: sql`(select id from reading_attempts where user_id = ${params.userId} and book_id = ${params.bookId} and outcome is null and deleted_at is null limit 1)`,
+        sessionId,
+        source: params.source,
+        sourceDeviceKey: params.sourceDeviceKey,
         startedAt,
         endedAt: params.endedAt,
         durationSeconds,
         progressDelta,
-        timeZone: params.timeZone,
-      });
+        endProgress: params.endProgress,
+        syncIntervalStartedAt: interval.windowStart,
+      })
+      .onConflictDoNothing({ target: [readingSessions.userId, readingSessions.sessionId] })
+      .returning({ id: readingSessions.id });
 
-      return { kind: 'saved', durationSeconds, progressDelta, sessionId };
+    await this.writeSyncCursor(tx, params, interval.generation, cursorExists);
+    if (inserted.length === 0) return { kind: 'skipped', reason: 'duplicate_session_id' };
+
+    await this.upsertDailyStats(tx, {
+      userId: params.userId,
+      libraryId: fileRow.libraryId,
+      startedAt,
+      endedAt: params.endedAt,
+      durationSeconds,
+      progressDelta,
+      timeZone: params.timeZone,
     });
+
+    return { kind: 'saved', durationSeconds, progressDelta, sessionId };
   }
 
   async insertManualSession(params: InsertManualSessionParams): Promise<{ id: number; attemptId: number | null }> {
@@ -839,7 +900,20 @@ export class ReadingSessionRepository {
     await this.insertDailyStatsSegments(tx, userId, libraryId, segments, 'replace');
   }
 
-  private async updateSyncCursor(tx: Tx, params: RecordCumulativeReadingSessionParams, generation: number): Promise<void> {
+  private async writeSyncCursor(tx: Tx, params: RecordCumulativeReadingSessionParams, generation: number, exists: boolean): Promise<void> {
+    if (!exists) {
+      await tx.insert(readingSessionSyncCursors).values({
+        userId: params.userId,
+        bookId: params.bookId,
+        source: params.cursorSource,
+        sourceDeviceKey: params.sourceDeviceKey,
+        counter: params.counter,
+        generation,
+        lastModified: params.endedAt,
+      });
+      return;
+    }
+
     await tx
       .update(readingSessionSyncCursors)
       .set({ counter: params.counter, generation, lastModified: params.endedAt, updatedAt: new Date() })
